@@ -1,0 +1,17 @@
+; $Id$
+name = eAtlas EXIF
+description = [eatlas_exif] Automatically harvest metadata from images (JPEG) and insert it into the system. Highly recommand installing a multiple upload module alone with that one, like Plupload module.
+core = 7.x
+
+files[] = eatlas_exif.module
+
+package = eAtlas
+
+dependencies[] = eatlas_commons
+dependencies[] = media
+
+; Attributes used by the update module.
+; There fields needs to be removed if the module is migrated to Drupal.org
+project status url = "http://drupal.eatlas.org.au/modules/eatlas"
+version = "7.x-1.1"
+project = "eatlas_exif"

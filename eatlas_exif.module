@@ -1,0 +1,666 @@
+<?php
+
+// NOTE: PHP don't currently define GPSHPositioningError tag (PHP5 v5.3.10)
+// The following line will define it ONLY if it's not already defined.
+defined('GPSHPositioningError') or define('GPSHPositioningError', 'UndefinedTag:0x001F');
+
+// Protection: This method is called just before setting the value to
+//     the DB. At this point, the string should be valid. If it's not
+//     for any reason, this method will clean it up by removing all
+//     invalid characters.
+function _eatlas_exif_convert_to_UTF8($text) {
+	// Convert none UTF-8 char to UTF-8 (protection against DB crash).
+	return iconv('utf-8', 'utf-8//ignore', $text);
+}
+
+/**
+ * Utility method to get a value from an image metadata.
+ * $metadata: Array returned by "eatlas_exif_get_image_metadata"
+ * $key: Key defined in $eatlas_exif_exif_fields ('title', 'description', etc)
+ * $maxLength: The value is truncated if it's longer than the specified number.
+ */
+function eatlas_exif_get_metadata_value($metadata, $key, $maxLength=NULL) {
+	$rawValue = _eatlas_exif_get_metadata_raw_value($metadata, $key);
+	if ($maxLength) {
+		if (is_string($rawValue)) {
+			$rawValue = substr($rawValue, 0, $maxLength);
+		} else if (is_array($rawValue)) {
+			foreach($rawValue as &$rawValueCell) {
+				$rawValueCell = substr($rawValueCell, 0, $maxLength);
+			}
+		}
+	}
+	return $rawValue;
+}
+
+function _eatlas_exif_get_metadata_raw_value($metadata, $key) {
+	// Location of values, in the metadata, in order of preference.
+	// NOTE: This has to be in sync with EAtlasField.java in the ImageMetadataEditor application.
+	// Declare the variable array (static = declared only once)
+	// NOTE 2018-07-31: PHP 7 have completely destroyed the EXIF reader for WINXP section. I can't find any way to fix it.
+	static $eatlas_exif_exif_fields = array(
+		//'title'           => array(array('WINXP', 'Title'), array('IFD0', 'ImageDescription'), array('IPTC', 'city')),
+		//'description'     => array(array('WINXP', 'Subject'), array('IPTC', 'caption')),
+		//'photographers'   => array(array('WINXP', 'Author'), array('IPTC', 'by_line')),
+		'title'           => array(array('IFD0', 'ImageDescription'), array('IPTC', 'city')),
+		'description'     => array(array('IPTC', 'caption')),
+		'photographers'   => array(array('IPTC', 'by_line')),
+		'attribution'     => array(array('IPTC', 'copyright_notice')),
+		// Used for Licence
+		//'keywords'        => array(array('WINXP', 'Keywords'), array('IPTC', 'keywords')),
+		'keywords'        => array(array('IPTC', 'keywords')),
+		// Used for the reason to not choose Creative Commons licence
+		//'comments'        => array(array('WINXP', 'Comments')),
+
+		'location'        => array(array('IPTC', 'sublocation')),
+
+		'longitude'       => array(array('GPS', 'GPSLongitude')),
+		'longitudeRef'    => array(array('GPS', 'GPSLongitudeRef')), // 'E' or 'W'
+		'latitude'        => array(array('GPS', 'GPSLatitude')),
+		'latitudeRef'     => array(array('GPS', 'GPSLatitudeRef')), // 'N' or 'S'
+
+		'radius'          => array(array('GPS', GPSHPositioningError)),
+
+		// Unused - Kept for reference
+		'altitude'        => array(array('GPS', 'GPSAltitude')),
+		'altitudeRef'     => array(array('GPS', 'GPSAltitudeRef')), // 0 = Above sea level, 1 = Below sea level (default 0)
+		'imgDirection'    => array(array('GPS', 'GPSImgDirection')),
+		'imgDirectionRef' => array(array('GPS', 'GPSImgDirectionRef')), // 'T' = True direction, 'M' = Magnetic direction
+
+		'orientation'     => array(array('EXIF', 'Orientation'))
+	);
+
+	if (!$metadata || !$key || !array_key_exists($key, $eatlas_exif_exif_fields)) {
+		return NULL;
+	}
+
+	$tags = $eatlas_exif_exif_fields[$key];
+	foreach ($tags as $tag) {
+		if (array_key_exists($tag[0], $metadata)) {
+			$group = $metadata[$tag[0]];
+			if ($group) {
+				if ($tag[0] === 'IPTC') {
+					$value = _eatlas_exif_get_iptc_value($group, $tag[1]);
+					if ($value) {
+						return $value;
+					}
+				} else {
+					if (array_key_exists($tag[1], $group)) {
+						if ($tag[0] === 'GPS' && ($tag[1] === 'GPSLongitude' || $tag[1] === 'GPSLatitude' || $tag[1] === 'GPSAltitude' || $tag[1] === 'GPSImgDirection')) {
+							return _eatlas_exif_get_gps_coordinate($group[$tag[1]]);
+						} else if ($tag[0] === 'GPS' && $tag[1] === GPSHPositioningError) {
+							return _eatlas_exif_get_gps_radius($group[$tag[1]]);
+						} else {
+							$value = $group[$tag[1]];
+							if (is_string($value)) {
+								$value = trim($value);
+							}
+							if ($value) {
+								return $value;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return NULL;
+}
+
+/**
+ * Extract the metadata from an image and save it in the appropriate
+ * Drupal fields.
+ */
+
+/**
+ * Implement hook_file_insert
+ * On file insert, extract the metadata values from the image file and
+ * save into the Drupal image entity.
+ * https://api.drupal.org/api/drupal/modules%21system%21system.api.php/function/hook_file_insert/7
+ */
+function eatlas_exif_file_insert($imageFile) {
+	$imageFileURI = drupal_realpath($imageFile->uri);
+	$metadata = eatlas_exif_get_image_metadata($imageFileURI);
+	if ($metadata) {
+		$persons = NULL; $organisations = NULL; $organisationSections = NULL; $galleries = NULL;
+		// WARNING: Watchdog CRASH when the message contains invalid
+		//     char like \0 and it's impossible to catch that exception.
+		//     In this case, file_put_contents do a better job.
+		//file_put_contents('/home/reefatlas/_TO_DELETE_/output.txt', print_r($metadata, TRUE));
+
+		// AIMS Tags
+		// X   static String TAG_LATITUDE = "GPSLatitude";
+		// X   static String TAG_LONGITUDE = "GPSLongitude";
+		// X   static String TAG_DEPTH = "GPSAltitude";
+		//     static String TAG_THUMBNAIL = "ThumbnailImage";
+		//     static String TAG_THUMBNAIL_SIZE = "ThumbnailLength";
+		// X   static String TAG_KEYWORDS = "Keywords";
+		// X   static String TAG_PHOTOGRAPHER = "By-line";
+		// X   static String TAG_LOCATION = "City";
+		// X   static String TAG_COPYRIGHT = "CopyrightNotice";
+		// X   static String TAG_CAPTION = "Caption-Abstract";
+		// X   static String TAG_LAT_DIR = "GPSLatitudeRef";
+		// X    static String TAG_LONG_DIR = "GPSLongitudeRef";
+
+		$gps = NULL;
+		$gps_valid = TRUE;
+
+		$lon = eatlas_exif_get_metadata_value($metadata, 'longitude');
+		$lonRef = eatlas_exif_get_metadata_value($metadata, 'longitudeRef', 1);
+		if ($lonRef) {
+			if (!$lonRef === 'E' && !$lonRef === 'W') {
+				$gps_valid = FALSE;
+			} else if ($lonRef === 'W') {
+				$lon *= -1;
+			}
+		}
+
+		$lat = eatlas_exif_get_metadata_value($metadata, 'latitude');
+		$latRef = eatlas_exif_get_metadata_value($metadata, 'latitudeRef', 1);
+		if ($latRef) {
+			if (!$latRef === 'N' && !$latRef === 'S') {
+				$gps_valid = FALSE;
+			} else if ($latRef === 'S') {
+				$lat *= -1;
+			}
+		}
+
+		$radius = eatlas_exif_get_metadata_value($metadata, 'radius');
+
+		$title = eatlas_exif_get_metadata_value($metadata, 'title', 255);
+		$description = eatlas_exif_get_metadata_value($metadata, 'description');
+		$location = eatlas_exif_get_metadata_value($metadata, 'location', 255);
+		$attribution = eatlas_exif_get_metadata_value($metadata, 'attribution');
+		$keywords = eatlas_exif_get_metadata_value($metadata, 'keywords');
+		$photographers = eatlas_exif_get_metadata_value($metadata, 'photographers');
+
+		if ($title) {
+			eatlas_commons_set_entity_value('file', $imageFile, 'media_title', $title);
+		}
+
+		if ($description) {
+			eatlas_commons_set_entity_value('file', $imageFile, 'media_description', array('value' => $description, 'format' => 'basic_html'));
+		}
+
+		if ($location) {
+			eatlas_commons_set_entity_value('file', $imageFile, 'field_location', $location[0]);
+		}
+
+		if ($keywords) {
+			$keywordsArray = explode(';', $keywords);
+
+			$license = NULL;
+			$gallery_prefix = 'GALLERY=';
+			$matching_gallery_ids = array();
+			foreach ($keywordsArray as $keyword) {
+				$keyword = trim($keyword);
+				if (!empty($keyword)) {
+					// GALLERY
+					// if $keyword ends with $gallery_prefix
+					if (strrpos($keyword, $gallery_prefix, -strlen($keyword)) !== FALSE) {
+						// remove $gallery_prefix to end up with the gallery name
+						$gallery_str = substr($keyword, strlen($gallery_prefix));
+
+						// Find the Gallery nodes
+						// Load needed web site entities (if they haven been loaded yet)
+						if ($galleries === NULL) {
+							// Load all galleries (custom content type - not related to "Media Gallery" module)
+							$galleries = entity_load('node', FALSE, array('type' => 'gallery')); // TODO Condition is Deprecated!!
+						}
+						$matchingGallery = eatlas_commons_get_entity_by_alias($gallery_str, $galleries);
+						if ($matchingGallery) {
+							array_push($matching_gallery_ids, $matchingGallery->nid);
+						} else {
+							watchdog('eatlas_exif', "Gallery \"$gallery_str\" could not be found for file \"".$imageFile->filename."\" [File ID: ".$imageFile->fid."].");
+						}
+					}
+
+					// LICENCE
+					if ($license === NULL) {
+						// The user may had enter "CC_BY", "cc by", "CC - BY", etc.
+						// Even it the user really try to write it as "CC-BY",
+						// the edition software (like Ms Excel) may decide to
+						// replace the hyphen "-" with some weird char that looks
+						// just like it (there is a huge collection of them in
+						// UTF-8).
+						// An easy solution is to remove all non Alpha numeric
+						// chars.
+						// NOTE: strcasecmp: Binary safe case-insensitive string comparison 
+						$safeKeyword = preg_replace("/[^\w\d]/", '', $keyword);
+						// License values defined in
+						//     file: media_gallery/media_gallery.fields.inc
+						//     function: _media_gallery_get_field_license_values
+						if (strcasecmp($safeKeyword, 'CCSANC') === 0 ||
+								strcasecmp($safeKeyword, 'CCNCSA') === 0 ||
+								strcasecmp($safeKeyword, 'CCBYSANC') === 0 ||
+								strcasecmp($safeKeyword, 'CCBYNCSA') === 0) {
+							$license = 'cc_sa_nc';
+
+						} else if (strcasecmp($safeKeyword, 'CCNC') === 0 ||
+								strcasecmp($safeKeyword, 'CCBYNC') === 0) {
+							$license = 'cc_nc';
+
+						} else if (strcasecmp($safeKeyword, 'CCNDNC') === 0 ||
+								strcasecmp($safeKeyword, 'CCNCND') === 0 ||
+								strcasecmp($safeKeyword, 'CCBYNDNC') === 0 ||
+								strcasecmp($safeKeyword, 'CCBYNCND') === 0) {
+							$license = 'cc_nd_nc';
+
+						} else if (strcasecmp($safeKeyword, 'CC') === 0 ||
+								strcasecmp($safeKeyword, 'CCBY') === 0) {
+							$license = 'cc';
+
+						} else if (strcasecmp($safeKeyword, 'CCSA') === 0 ||
+								strcasecmp($safeKeyword, 'CCBYSA') === 0) {
+							$license = 'cc_sa';
+
+						} else if (strcasecmp($safeKeyword, 'CCND') === 0 ||
+								strcasecmp($safeKeyword, 'CCBYND') === 0) {
+							$license = 'cc_nd';
+
+						} else if (strcasecmp($safeKeyword, 'Copyright') === 0) {
+							$license = 'copyright';
+						}
+					}
+				}
+			}
+
+			// 'copyright' is the default value (no need to update)
+			if ($license && $license !== 'copyright') {
+				eatlas_commons_set_entity_value('file', $imageFile, 'field_license', $license);
+			} else {
+				// It's copyright, we need to save the reason for not been CC-BY
+				$comments = eatlas_exif_get_metadata_value($metadata, 'comments');
+				$reasonForNotCCBY = _eatlas_exif_get_reason_for_not_ccby($comments);
+				if ($reasonForNotCCBY) {
+					eatlas_commons_set_entity_value('file', $imageFile, 'field_notes', $reasonForNotCCBY);
+				}
+			}
+
+			if (count($matching_gallery_ids)) {
+				eatlas_commons_set_entity_value('file', $imageFile, 'field_galleries', $matching_gallery_ids);
+			}
+		}
+
+		if ($gps_valid) {
+			eatlas_commons_set_entity_value('file', $imageFile, 'field_gpslongitude', $lon);
+			eatlas_commons_set_entity_value('file', $imageFile, 'field_gpslatitude', $lat);
+		}
+
+		if ($radius) {
+			// The radius (field GPSHPositioningError) is in meters. We want a radius in km.
+			$kmRadius = $radius / 1000;
+			eatlas_commons_set_entity_value('file', $imageFile, 'field_gpsradius', $kmRadius);
+		}
+
+		if ($photographers) {
+			// Load needed web site entities (if they haven been loaded yet)
+			if ($persons === NULL) {
+				$persons = entity_load('node', FALSE, array('type' => 'person')); // TODO Condition is Deprecated!!
+			}
+
+			// Sometime $photographers is already an array... I'm not sure why
+			if (!is_array($photographers)) {
+				// TODO explode the String? Why this variable is an array? How can I set multiple photographers?
+				$photographers = array($photographers);
+			}
+			// $photographers is not always splited (I never seen it splited).
+			// The values looks like: "Foo Bar;John Smith"
+			$photographersArray = array();
+			foreach ($photographers as $photographer) {
+				$photographersArray = array_merge($photographersArray, explode(';', $photographer));
+			}
+
+			$photographersEntities = _eatlas_exif_get_persons_and_organisations($photographersArray, $persons, NULL, NULL);
+			$matchingPhotographersIds = $photographersEntities[0];
+			$freeTextPhotographers = $photographersEntities[1];
+
+			if (count($matchingPhotographersIds)) {
+				eatlas_commons_set_entity_value('file', $imageFile, 'field_photographers', $matchingPhotographersIds);
+			}
+			if ($freeTextPhotographers) {
+				eatlas_commons_set_entity_value('file', $imageFile, 'field_custom_photographers', $freeTextPhotographers);
+			}
+		}
+
+		if ($attribution) {
+			// Load needed web site entities (if they haven been loaded yet)
+			if ($persons === NULL) {
+				$persons = entity_load('node', FALSE, array('type' => 'person')); // TODO Condition is Deprecated!!
+			}
+			if ($organisations === NULL) {
+				$organisations = entity_load('node', FALSE, array('type' => 'organisation')); // TODO Condition is Deprecated!!
+			}
+			if ($organisationSections === NULL) {
+				$organisationSections = entity_load('node', FALSE, array('type' => 'organisation_section')); // TODO Condition is Deprecated!!
+			}
+
+			// This field (usually an array) contains the attribution
+			// which is usually a list of "Person" and/or "Institution"
+			if (!is_array($attribution)) {
+				$attribution = array($attribution);
+			}
+			$attributionArray = array();
+			foreach ($attribution as $attributionItem) {
+				$attributionArray = array_merge($attributionArray, explode(';', $attributionItem));
+			}
+
+			$attributionEntities = _eatlas_exif_get_persons_and_organisations($attributionArray, $persons, $organisations, $organisationSections);
+			$matchingAttributionIds = $attributionEntities[0];
+			$freeTextAttribution = $attributionEntities[1];
+
+			if (count($matchingAttributionIds)) {
+				eatlas_commons_set_entity_value('file', $imageFile, 'field_attribution', $matchingAttributionIds);
+			}
+			if ($freeTextAttribution) {
+				eatlas_commons_set_entity_value('file', $imageFile, 'field_custom_attribution', $freeTextAttribution);
+			}
+		}
+	}
+
+	return $imageFile;
+}
+
+/**
+ * Given an array of Strings ($personsNameArray), this method look through
+ * the list of entities($persons, $organisations and $organisationSections)
+ * to find matches.
+ * Returns:
+ *     array(
+ *         [0] => array(
+ *             ID (Integer) of matching entities, in the following order:
+ *                 Organisations IDs that are not associated with a person,
+ *                 Persons associated with organisation (Person ID following by its Organisation ID),
+ *                 Persons IDs that do not have organisation associated with
+ *         ),
+ *         [1] => array(
+ *             Strings that do not match anything
+ *         )
+ *     )
+ */
+function _eatlas_exif_get_persons_and_organisations($personsNameArray, $persons, $organisations, $organisationSections) {
+	// Make 3 groups (org, persons with org, persons) and merge the 3 groups toggether at the end
+	$matchingOrganisationsIds = array();
+	$matchingPersonsWithOrganisationIds = array();
+	$matchingPersonsIds = array();
+
+	$notMatchingPersons = '';
+
+	foreach ($personsNameArray as $rawPersonName) {
+		$rawPersonName = trim($rawPersonName);
+		$personName = NULL;
+		$organisationName = NULL;
+		// $personName is usually in the form of "name (organisation)". We need to extract both parts
+		if (preg_match('/(.*)\((.*)\)/', $rawPersonName, $matches)) {
+			$personName = trim($matches[1]);
+			$organisationName = trim($matches[2]);
+		}
+
+		if ($personName && $organisationName) {
+			// There is an organisation in brakets after the name
+			// IE: "John Doe (AIMS)"
+			$matchingPerson = eatlas_commons_get_entity_by_alias($personName, $persons);
+
+			if ($organisations == NULL && $organisationSections == NULL) {
+				// If NULL is passed for the organisations, we don't care about it (photographers)
+				if ($matchingPerson !== NULL) {
+					array_push($matchingPersonsIds, $matchingPerson->nid);
+				} else {
+					if ($notMatchingPersons) {
+						$notMatchingPersons .= ', ';
+					}
+					$notMatchingPersons .= $rawPersonName;
+				}
+			} else {
+				// The list of organisations is not null, look for it (attribution)
+				$matchingOrganisation = NULL;
+				if ($organisations) {
+					$matchingOrganisation = eatlas_commons_get_entity_by_alias($organisationName, $organisations);
+				}
+				if ($matchingOrganisation === NULL && $organisationSections) {
+					$matchingOrganisation = eatlas_commons_get_entity_by_alias($organisationName, $organisationSections);
+				}
+
+				if ($matchingPerson !== NULL && $matchingOrganisation !== NULL) {
+					// Both the person AND the organisation has been found.
+					array_push($matchingPersonsWithOrganisationIds, $matchingPerson->nid);
+					array_push($matchingPersonsWithOrganisationIds, $matchingOrganisation->nid);
+				} else {
+					// At lease one is missing (either the person or the organisation)
+					// Add what has been found to the list, and also add the
+					// full attribution string to the free text attribution
+					if ($matchingPerson !== NULL) {
+						array_push($matchingPersonsIds, $matchingPerson->nid);
+					} else if ($matchingOrganisation !== NULL) {
+						array_push($matchingOrganisationsIds, $matchingOrganisation->nid);
+					}
+
+					if ($notMatchingPersons) {
+						$notMatchingPersons .= ', ';
+					}
+					$notMatchingPersons .= $rawPersonName;
+				}
+			}
+		} else {
+			// There is no organisation in brakets after the name.
+			// It can either be a standalong person name or an organisation.
+			// IE: "AIMS", "John Doe", etc.
+			$matchingPerson = eatlas_commons_get_entity_by_alias($rawPersonName, $persons);
+			$matchingOrganisation = NULL;
+			if ($matchingPerson === NULL && $matchingOrganisation == NULL && $organisations) {
+				$matchingOrganisation = eatlas_commons_get_entity_by_alias($rawPersonName, $organisations);
+			}
+			if ($matchingPerson === NULL && $matchingOrganisation == NULL && $organisationSections) {
+				$matchingOrganisation = eatlas_commons_get_entity_by_alias($rawPersonName, $organisationSections);
+			}
+
+			// If the person / organisation is not found, it goes to the "Free text attributions"
+			if ($matchingPerson !== NULL) {
+				array_push($matchingPersonsIds, $matchingPerson->nid);
+			} else if ($matchingOrganisation !== NULL) {
+				array_push($matchingOrganisationsIds, $matchingOrganisation->nid);
+			} else {
+				if ($notMatchingPersons) {
+					$notMatchingPersons .= ', ';
+				}
+				$notMatchingPersons .= $rawPersonName;
+			}
+		}
+	}
+
+	return array(array_merge($matchingOrganisationsIds, $matchingPersonsWithOrganisationIds, $matchingPersonsIds), $notMatchingPersons);
+}
+
+/**
+ * Wrapper around the PHP functions (exif_read_data and GetImageSize)
+ * used to extract an image metadata.
+ */
+function eatlas_exif_get_image_metadata($imageURI) {
+	if (!file_exists($imageURI)) {
+		return array();
+	}
+
+	// Set EXIF encoding to UTF-8, globally;
+	// When the system tries to read some groups (like WINXP) with
+	// the default encoding "ISO-8859-15", it crashes the system
+	// while trying to update the database.
+	ini_set('exif.encode_unicode', 'UTF-8');
+
+	// NOTE: Calling "exif_read_data" using the "@" symbol disable
+	//     warnings. Since this function threat the case where
+	//     there is no metadata, there is no reason to care about
+	//     warnings.
+	$metadata = @exif_read_data($imageURI, 'ANY_TAG', TRUE);
+	if (!$metadata) {
+		$metadata = array();
+	}
+
+	// exif_read_data can't read IPTC
+	// GetImageSize read IPTC metadata and output it in $infoImage
+	$infoImage = NULL;
+	$size = @GetImageSize($imageURI, $infoImage);
+	if (isset($infoImage['APP13'])) {
+		$iptc = iptcparse($infoImage['APP13']);
+		$metadata['IPTC'] = $iptc;
+	}
+
+	return $metadata;
+}
+
+/**
+ * The GPS values (longitude and latitude) are saved as 3 rational
+ * numbers in the EXIF metadata. They need to be added up, with their
+ * respective proportions.
+ * IE: Degree + minutes/60 + secondes/3600
+ */
+function _eatlas_exif_get_gps_coordinate($gpsCoordinateArray) {
+	if (!is_array($gpsCoordinateArray)) {
+		$gpsCoordinateArray = array($gpsCoordinateArray);
+	}
+	$dec = 0;
+	$granularity = 0;
+	foreach ($gpsCoordinateArray as $element) {
+		$parts = explode('/', $element);
+		if (!$parts[0] || !$parts[1]) {
+			$dec += 0;
+		} else {
+			$dec += (float) (((float) $parts[0] /  (float) $parts[1]) / pow(60, $granularity));
+		}
+		$granularity++;
+	}
+	return $dec;
+}
+function _eatlas_exif_get_gps_radius($gpsRawRadius) {
+	$parts = explode('/', $gpsRawRadius);
+	if (!$parts[0] || !$parts[1]) {
+		return 0;
+	} else {
+		return (float) ((float) $parts[0] /  (float) $parts[1]);
+	}
+}
+
+function _eatlas_exif_get_reason_for_not_ccby($comments) {
+	$REASON_PREFIXES = array(
+		'Licence extra: ', // Licence is spelt with a "c" in Australia and UK
+		'License extra: '  // License is spelt with a "s" in USA
+	);
+
+	$lines = preg_split('/\R/', $comments);
+	foreach ($lines as $line) {
+		foreach ($REASON_PREFIXES as $prefix) {
+			if (strpos($line, $prefix) === 0) {
+				return substr($line, strlen($prefix));
+			}
+		}
+	}
+	return NULL;
+}
+
+/**
+ * Return the IPTC value (UTF-8) for a given human readable key.
+ */
+function _eatlas_exif_get_iptc_value($iptc, $key) {
+	$keyCode = _eatlas_exif_get_iptc_key_code($key);
+	if ($keyCode === NULL || !isset($iptc[$keyCode])) {
+		return NULL;
+	}
+	$value = $iptc[$keyCode];
+	if ($value) {
+		// Detect IPTC encoding (if defined)
+		// If the encoding is not defined, just assume it's NOT UTF-8.
+		// '\x1B%G' = UTF-8
+		// '\x1b(B' = ASCII
+		// '\x1b-A' or '\x1b(@\x1b-A' or '\x1b(B\x1b-A' = iso-8859-1
+		// etc.
+		// See: https://github.com/brion/MediaWiki/blob/master/includes/media/IPTC.php
+		$isUTF8 = isset($iptc[_eatlas_exif_get_iptc_key_code('envelope_character_set')]) ?
+				$iptc[_eatlas_exif_get_iptc_key_code('envelope_character_set')] === '\x1B%G' :
+				FALSE;
+		if (is_string($value)) {
+			if (!$isUTF8) {
+				$value = utf8_encode($value);
+			}
+			$value = trim($value);
+		} else if (is_array($value)) {
+			foreach ($value as $key => $val) {
+				if (!$isUTF8) {
+					$val = utf8_encode($val);
+				}
+				$value[$key] = trim($val);
+			}
+		}
+	}
+
+	return $value;
+}
+
+/**
+ * Return the IPTC computer code for a given human readable key.
+ */
+function _eatlas_exif_get_iptc_key_code($key) {
+	$keyCodesMap = array (
+		'object_data_preview_data' => '2#202',
+		'object_data_preview_file_format_version' => '2#201',
+		'object_data_preview_file_format' => '2#200',
+		'audio_outcue' => '2#154',
+		'audio_duration' => '2#153',
+		'audio_sampling_resolution' => '2#152',
+		'audio_sampling_rate' => '2#151',
+		'audio_type' => '2#150',
+		'language_identifier' => '2#135',
+		'image_orientation' => '2#131',
+		'image_type' => '2#130',
+		'rasterized_caption' => '2#125',    
+		'writer' => '2#122',
+		'caption' => '2#120',
+		'contact' => '2#118',
+		'copyright_notice' => '2#116',
+		'source' => '2#115',
+		'credit' => '2#110',
+		'headline' => '2#105',
+		'original_transmission_reference' => '2#103',
+		'country_name' => '2#101',
+		'country_code' => '2#100',
+		'state' => '2#095',
+		'sublocation' => '2#092',
+		'city' => '2#090',
+		'by_line_title' => '2#085',
+		'by_line' => '2#080',
+		'object_cycle' => '2#075',
+		'program_version' => '2#070',
+		'originating_program' => '2#065',
+		'digital_creation_time' => '2#063',
+		'digital_creation_date' => '2#062',   
+		'creation_time' => '2#060',
+		'creation_date' => '2#055',
+		'reference_number' => '2#050',
+		'reference_date' => '2#047',
+		'reference_service' => '2#045',
+		'action_advised' => '2#042',
+		'special_instruction' => '2#040',
+		'expiration_time' => '2#038',
+		'expiration_date' => '2#037',
+		'release_time' => '2#035',
+		'release_date' => '2#030',
+		'content_location_name' => '2#027',
+		'content_location_code' => '2#026',
+		'keywords' => '2#025',
+		'fixture_identifier' => '2#022',
+		'supplemental_category' => '2#020', 
+		'category' => '2#015',
+		'subject_reference' => '2#010', 
+		'urgency' => '2#010',
+		'editorial_update' => '2#008',
+		'edit_status' => '2#007',
+		'object_name' => '2#005',
+		'object_attribute_reference' => '2#004',
+		'object_type_reference' => '2#003',
+		'record_version' => '2#000',
+		'envelope_character_set' => '1#090'
+	);
+
+	return isset($keyCodesMap[$key]) ? $keyCodesMap[$key] : NULL;
+}
+
+?>
